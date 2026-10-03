@@ -1,0 +1,12 @@
+# lunaQuest backend — minimal dependency set for a <=0.6 GB RAM VPS.
+# Single uvicorn worker, SQLite (stdlib sqlite3), no ORM, no Redis, no Celery.
+fastapi==0.115.6
+uvicorn[standard]==0.32.1       # stdlib extras excluded on purpose? kept for httptools speed; safe in 0.6GB
+pydantic[email]==2.10.4
+orjson==3.10.12                  # fast, low-memory JSON serialization
+passlib==1.7.4
+bcrypt==4.2.1                    # password hashing (cost 12)
+PyJWT==2.10.1                    # signed JWT sessions in httpOnly cookies
+slowapi==0.1.9                   # in-memory rate limiting (no Redis)
+python-multipart==0.0.20         # multipart form parsing (file uploads, streamed)
+email-validator==2.2.0
