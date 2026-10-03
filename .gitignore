@@ -1,7 +1,4 @@
-# Compiled/Binary files
 __pycache__/
 *.pyc
-
-# Environment/Sensitive files
 .env
 .secret_key

@@ -27,25 +27,13 @@ from slowapi.errors import RateLimitExceeded             # noqa: E402
 from slowapi.util import get_remote_address              # noqa: E402
 
 from . import config, db, security                        # noqa: E402
+from .limiter import limiter                              # noqa: E402
 from .routers import admin as r_admin                     # noqa: E402
 from .routers import auth as r_auth                       # noqa: E402
 from .routers import misc as r_misc                       # noqa: E402
 from .routers import public as r_public                   # noqa: E402
 from .routers import responses as r_responses             # noqa: E402
 from .routers import surveys as r_surveys                 # noqa: E402
-
-
-# Trust the first hop of X-Forwarded-For when running behind Caddy/Nginx so
-# per-IP rate limits keep working in a reverse-proxy deployment.
-def _client_ip(request: Request) -> str:
-    xff = request.headers.get("x-forwarded-for", "")
-    if xff:
-        return xff.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
-
-
-limiter = Limiter(key_func=_client_ip, default_limits=[],
-                  headers_enabled=True, storage_uri="memory://")
 
 
 @asynccontextmanager
@@ -78,14 +66,29 @@ if origins := os.environ.get("LUNAQ_CORS_ORIGINS", ""):
     )
 
 
+# Endpoints that must be reachable BEFORE a session/CSRF cookie exists.
+# SameSite=Lax + the double-submit middleware below still protect every other
+# mutation; these are credential-entry points with no prior state to forge.
+_CSRF_EXEMPT_PATHS = {"/api/auth/register", "/api/auth/login",
+                      "/api/auth/forgot-password", "/api/auth/reset-password"}
+
+
 @app.middleware("http")
 async def csrf_middleware(request: Request, call_next):
-    """Enforce double-submit CSRF on every cookie-authenticated mutation."""
+    """Enforce double-submit CSRF on every cookie-authenticated mutation.
+
+    Public survey-taking requests (no session cookie, no API key) are exempt:
+    there is no authenticated state for an attacker to ride on.  Everything
+    else under /api with an unsafe method must echo the `lq_csrf` cookie in
+    the `X-CSRF-Token` header.
+    """
     path = request.url.path
-    is_public_take = (path.startswith("/api/public/")
-                      and not request.headers.get("authorization", "").startswith("Bearer lqk_")
-                      and not request.cookies.get(config.COOKIE_SESSION))
-    if path.startswith("/api") and request.method in ("POST", "PUT", "PATCH", "DELETE") and not is_public_take:
+    has_session = bool(request.cookies.get(config.COOKIE_SESSION))
+    has_api_key = request.headers.get("authorization", "").startswith("Bearer lqk_")
+    is_exempt = (path in _CSRF_EXEMPT_PATHS
+                 or (path.startswith("/api/public/") and not has_session and not has_api_key))
+    if path.startswith("/api") and request.method in ("POST", "PUT", "PATCH", "DELETE") \
+            and not is_exempt and (has_session or has_api_key):
         try:
             security.verify_csrf(request)
         except Exception as exc:  # HTTPException → JSON error response
@@ -100,21 +103,28 @@ async def csrf_middleware(request: Request, call_next):
 
 
 # ---------------------------------------------------------------------------
-# Routers — all under /api.  static_router first so /summary & /export beat
-# /{response_id}.  Auth endpoints carry tight rate limits (5/min/IP).
+# Rate limiting — slowapi decorator style.  NOTE: `Depends(limiter.limit(...))`
+# must never be used: FastAPI would treat the wrapped limiter function itself
+# as a required query parameter and break every route in the router.  Instead
+# each limited endpoint carries @limiter.limit("N/minute") inside its router
+# module (auth: 5/min, survey writes: 60/min, public taking: 30/min).
 # ---------------------------------------------------------------------------
-app.include_router(r_auth.router, prefix="/api",
-                   dependencies=[Depends(limiter.limit(config.RATE_LIMIT_AUTH))])
+app.state.limiter = limiter
+
+# ---------------------------------------------------------------------------
+# Routers — all under /api.  static_router first so /summary & /export beat
+# /{response_id}.  Auth endpoints carry tight rate limits (5/min/IP) applied
+# via @limiter.limit decorators registered on those routes.
+# ---------------------------------------------------------------------------
+app.include_router(r_auth.router, prefix="/api")
 app.include_router(r_auth.me_router, prefix="/api")
 app.include_router(r_misc.site_router, prefix="/api")
 app.include_router(r_misc.templates_router, prefix="/api")
 app.include_router(r_misc.router, prefix="/api")
-app.include_router(r_surveys.router, prefix="/api",
-                   dependencies=[Depends(limiter.limit(config.RATE_LIMIT_WRITE))])
+app.include_router(r_surveys.router, prefix="/api")
 app.include_router(r_responses.static_router, prefix="/api")
 app.include_router(r_responses.router, prefix="/api")
-app.include_router(r_public.router, prefix="/api",
-                   dependencies=[Depends(limiter.limit(config.RATE_LIMIT_TAKE))])
+app.include_router(r_public.router, prefix="/api")
 app.include_router(r_public.files_router, prefix="/api")
 app.include_router(r_admin.router, prefix="/api")
 

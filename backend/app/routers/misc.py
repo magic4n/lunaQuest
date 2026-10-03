@@ -12,7 +12,6 @@ def list_keys(user=Depends(security.get_current_user), conn=Depends(db.get_db)):
     return {"items": rows}
 @router.post("", status_code=201)
 def create_key(body: ApiKeyIn, request: Request,
-               csrf=Depends(security.verify_csrf),
                user=Depends(security.get_current_user), conn=Depends(db.get_db)):
     raw, key_hash = security.generate_api_key()
     db.execute(conn, "INSERT INTO api_keys (user_id,label,key_hash,prefix) VALUES (?,?,?,?)",
@@ -21,7 +20,6 @@ def create_key(body: ApiKeyIn, request: Request,
     return {"key": raw, "prefix": raw[:12], "warning": "Copy it now; it will not be shown again."}
 @router.delete("/{key_id}")
 def revoke_key(key_id: int, request: Request,
-               csrf=Depends(security.verify_csrf),
                user=Depends(security.get_current_user), conn=Depends(db.get_db)):
     conn.execute("DELETE FROM api_keys WHERE id=? AND user_id=?", (key_id, user["id"]))
     return {"ok": True}

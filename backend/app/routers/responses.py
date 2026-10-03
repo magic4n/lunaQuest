@@ -19,7 +19,7 @@ from typing import Any, Iterator
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from .. import db, security, surveys as S
+from .. import config, db, security, surveys as S
 
 router = APIRouter(prefix="/surveys/{survey_id}/responses", tags=["responses"])
 
@@ -102,8 +102,7 @@ def get_response(survey_id: int, response_id: int, request: Request, conn=Depend
 
 
 @router.delete("/{response_id}")
-def delete_response(survey_id: int, response_id: int, request: Request,
-                    csrf=Depends(security.verify_csrf), conn=Depends(db.get_db)):
+def delete_response(survey_id: int, response_id: int, request: Request, conn=Depends(db.get_db)):
     _require_results(conn, survey_id, request)
     conn.execute("DELETE FROM responses WHERE id=? AND survey_id=?", (response_id, survey_id))
     return {"deleted": True}
@@ -290,45 +289,56 @@ def _histogram_bins(cfg: dict, nums: list[float]) -> list[dict]:
 # ---------------------------------------------------------------------------
 @static_router.get("/export/csv")
 def export_csv(survey_id: int, request: Request, conn=Depends(db.get_db)):
+    """Streamed CSV export.
+
+    NOTE: the request-scoped `conn` is closed by FastAPI as soon as this
+    handler returns — but StreamingResponse bodies are consumed *after* that.
+    So the generator opens its OWN short-lived connection and closes it when
+    the stream ends (constant ~4 MB page cache per concurrent download).
+    """
     _require_results(conn, survey_id, request)
     questions = db.q(conn, "SELECT id,type,title FROM questions WHERE survey_id=? ORDER BY ordr", (survey_id,))
-    title = db.q1(conn, "SELECT title FROM surveys WHERE id=?", (survey_id,))["title"]
 
     def stream() -> Iterator[str]:
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        header = ["response_id", "started_at", "submitted_at", "user_email", "score"]
-        w.writerow(header + [f"Q{q['ordr']+1 if 'ordr' in q else ''} {q['title']}" for q in questions])
-        yield _drain(buf)
-        # Cursor over responses, then a small indexed lookup per response.
-        cur = conn.execute(
-            """SELECT r.id, r.started_at, r.submitted_at, u.email, r.score
-               FROM responses r LEFT JOIN users u ON u.id=r.user_id
-               WHERE r.survey_id=? AND r.submitted_at IS NOT NULL ORDER BY r.id""",
-            (survey_id,))
-        qids = [q["id"] for q in questions]
-        marks = ",".join("?" * len(qids)) if qids else "NULL"
-        while True:
-            chunk = cur.fetchmany(50)                    # bounded fetch size
-            if not chunk:
-                break
-            ids = [row[0] for row in chunk]
-            imarks = ",".join("?" * len(ids))
-            amap: dict[int, dict[int, Any]] = {i: {} for i in ids}
-            for rid, qid, vj in conn.execute(
-                    f"SELECT response_id,question_id,value_json FROM answers WHERE response_id IN ({imarks}) "
-                    f"AND question_id IN ({marks})", (*ids, *qids)):
-                amap[rid][qid] = json.loads(vj)
-            for row in chunk:
-                vals = [_csv_cell(amap[row[0]].get(qid)) for qid in qids]
-                w.writerow(list(row) + vals)
+        sconn = db._connect(config.DB_PATH)
+        try:
+            buf = io.StringIO()
+            w = csv.writer(buf)
+            header = ["response_id", "started_at", "submitted_at", "user_email", "score"]
+            w.writerow(header + [f"Q{i+1} {q['title']}" for i, q in enumerate(questions)])
             yield _drain(buf)
-        buf.close()
+            # Cursor over responses, then a small indexed lookup per chunk.
+            cur = sconn.execute(
+                """SELECT r.id, r.started_at, r.submitted_at, u.email, r.score
+                   FROM responses r LEFT JOIN users u ON u.id=r.user_id
+                   WHERE r.survey_id=? AND r.submitted_at IS NOT NULL ORDER BY r.id""",
+                (survey_id,))
+            qids = [q["id"] for q in questions]
+            marks = ",".join("?" * len(qids))
+            while True:
+                chunk = cur.fetchmany(50)                    # bounded fetch size
+                if not chunk:
+                    break
+                ids = [row[0] for row in chunk]
+                imarks = ",".join("?" * len(ids))
+                amap: dict[int, dict[int, Any]] = {i: {} for i in ids}
+                for rid, qid, vj in sconn.execute(
+                        f"SELECT response_id,question_id,value_json FROM answers WHERE response_id IN ({imarks})"
+                        + (f" AND question_id IN ({marks})" if qids else ""),
+                        (*ids, *qids) if qids else ids):
+                    amap[rid][qid] = json.loads(vj)
+                for row in chunk:
+                    vals = [_csv_cell(amap[row[0]].get(qid)) for qid in qids]
+                    w.writerow(list(row) + vals)
+                yield _drain(buf)
+        finally:
+            sconn.close()
 
     fname = f"lunaquest-{survey_id}.csv"
     return StreamingResponse(stream(), media_type="text/csv; charset=utf-8",
                              headers={"content-disposition": f'attachment; filename="{fname}"',
                                       "x-accel-buffering": "no"})
+
 
 
 def _drain(buf: io.StringIO) -> str:
@@ -353,34 +363,41 @@ def _csv_cell(val: Any) -> str:
 
 @static_router.get("/export/json")
 def export_json(survey_id: int, request: Request, conn=Depends(db.get_db)):
-    """Streamed JSON export (NDJSON-in-array via generator, constant memory)."""
+    """Streamed JSON export (single object with a responses array).
+
+    Uses its own short-lived connection inside the generator — same reason as
+    the CSV export above (request-scoped conn is closed before streaming).
+    """
     _require_results(conn, survey_id, request)
-    questions = db.q(conn, "SELECT id,title FROM questions WHERE survey_id=? ORDER BY ordr", (survey_id,))
 
     def stream() -> Iterator[str]:
-        yield '{"responses": ['
-        first = True
-        cur = conn.execute(
-            """SELECT r.* FROM responses r WHERE r.survey_id=? AND r.submitted_at IS NOT NULL ORDER BY r.id""",
-            (survey_id,))
-        while True:
-            chunk = cur.fetchmany(50)
-            if not chunk:
-                break
-            ids = [row["id"] for row in chunk]
-            imarks = ",".join("?" * len(ids))
-            amap: dict[int, list] = {r["id"]: [] for r in chunk}
-            for rid, qid, vj in conn.execute(
-                    f"SELECT response_id,question_id,value_json FROM answers WHERE response_id IN ({imarks})"):
-                amap[rid].append({"question_id": qid, "value": json.loads(vj)})
-            for row in chunk:
-                d = dict(row)
-                d["answers"] = amap[row["id"]]
-                if not first:
-                    yield ","
-                first = False
-                yield json.dumps(d, separators=(",", ":"))
-        yield "]}"
+        sconn = db._connect(config.DB_PATH)
+        try:
+            yield '{"responses": ['
+            first = True
+            cur = sconn.execute(
+                """SELECT r.* FROM responses r WHERE r.survey_id=? AND r.submitted_at IS NOT NULL ORDER BY r.id""",
+                (survey_id,))
+            while True:
+                chunk = [dict(r) for r in cur.fetchmany(50)]   # bounded fetch size
+                if not chunk:
+                    break
+                ids = [row["id"] for row in chunk]
+                imarks = ",".join("?" * len(ids))
+                amap: dict[int, list] = {r["id"]: [] for r in chunk}
+                for rid, qid, vj in sconn.execute(
+                        f"SELECT response_id,question_id,value_json FROM answers WHERE response_id IN ({imarks})",
+                        ids):
+                    amap[rid].append({"question_id": qid, "value": json.loads(vj)})
+                for row in chunk:
+                    row["answers"] = amap[row["id"]]
+                    if not first:
+                        yield ","
+                    first = False
+                    yield json.dumps(row, separators=(",", ":"))
+            yield "]}"
+        finally:
+            sconn.close()
 
     return StreamingResponse(stream(), media_type="application/json",
                              headers={"x-accel-buffering": "no"})

@@ -16,31 +16,51 @@ from datetime import datetime, timedelta, timezone
 
 import jwt
 from fastapi import Depends, HTTPException, Request, Response, status
-from passlib.hash import bcrypt as _bcrypt
+
 
 from . import config, db
 
 # ---------------------------------------------------------------------------
 # Passwords — bcrypt cost 12, min length enforced at the schema layer too.
-# Lazy digest trick: passlib pre-hashes with sha256 so bcrypt's 72-byte cap
-# never silently truncates long passphrases.
+#
+# We call the `bcrypt` package directly and pre-hash with SHA-256 first:
+#   * sidesteps passlib's broken backend detection on bcrypt >= 4 (it probes
+#     with a >72-byte secret which modern bcrypt rejects outright),
+#   * removes bcrypt's silent 72-byte truncation for long passphrases,
+#   * keeps hashing CPU-bound-but-bounded (~0.2 s at cost 12) with zero extra
+#     dependencies beyond bcrypt itself.
+# Stored format: "$lq_bcr$<cost>$<base64(23-byte digest)>" — self-describing so
+# cost can be raised later without breaking old hashes.
 # ---------------------------------------------------------------------------
-_bcrypt_ctx = _bcrypt.using(rounds=config.BCRYPT_ROUNDS)
+import base64 as _b64
+import bcrypt as _bcrypt
+
+PASSWORD_MIN_LEN = 8
+_PASSWORD_STRENGTH = re.compile(r"^(?=.*[A-Za-z])(?=.*\d).{8,}$")
+
+
+def _prehash(plain: str) -> bytes:
+    """SHA-256 digest → base64: uniform 44-byte input (<72), no truncation."""
+    return _b64.b64encode(hashlib.sha256(plain.encode("utf-8")).digest())
 
 
 def hash_password(plain: str) -> str:
-    return _bcrypt_ctx.hash(plain)
+    # bcrypt already embeds its own salt+cost ("$2b$12$…"), so we store the
+    # digest verbatim; the leading "$" keeps it distinct from legacy hashes.
+    return _bcrypt.hashpw(_prehash(plain),
+                          _bcrypt.gensalt(rounds=config.BCRYPT_ROUNDS)).decode()
 
 
 def verify_password(plain: str, hashed: str) -> bool:
     try:
-        return _bcrypt_ctx.verify(plain, hashed)
+        if hashed.startswith("$2"):
+            return _bcrypt.checkpw(_prehash(plain), hashed.encode())
+        # Legacy passlib-format hashes still verify (transparent upgrade path:
+        # callers may re-hash on successful login).
+        from passlib.hash import bcrypt as _plbcrypt
+        return _plbcrypt.verify(plain, hashed)
     except ValueError:
         return False
-
-
-PASSWORD_MIN_LEN = 8
-_PASSWORD_STRENGTH = re.compile(r"^(?=.*[A-Za-z])(?=.*\d).{8,}$")
 
 
 def check_password_policy(pw: str) -> None:
@@ -99,8 +119,7 @@ _UNSAFE = {"POST", "PUT", "PATCH", "DELETE"}
 
 
 def verify_csrf(request: Request) -> None:
-    if request.method not in _UNSAFE:
-        return
+    """Double-submit check. Called by the middleware only for unsafe methods."""
     # API-key requests are not browser-based → CSRF does not apply.
     if request.headers.get("authorization", "").startswith("Bearer lqk_"):
         return

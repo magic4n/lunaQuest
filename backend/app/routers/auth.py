@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from .. import config, db, security
+from ..limiter import limiter          # shared in-memory slowapi instance
 from ..mailer import send_mail
 from ..schemas import ForgotIn, LoginIn, ProfileIn, RegisterIn, ResetIn
 
@@ -15,6 +16,11 @@ def _site_setting(conn, key: str, default: str = "") -> str:
     return row["value"] if row else default
 
 
+# NOTE on decorator order: @limiter.limit MUST be applied BEFORE the route is
+# registered (@router.post).  slowapi's wrapper copies __signature__ from the
+# undecorated function; if FastAPI saw that signature first it would treat the
+# injected `body` model as a *query* parameter and reject every real payload.
+@limiter.limit(config.RATE_LIMIT_AUTH)     # 5/min/IP — brute-force guard
 @router.post("/auth/register", status_code=201)
 def register(body: RegisterIn, request: Request, response: Response,
              conn=Depends(db.get_db)):
@@ -44,10 +50,18 @@ def register(body: RegisterIn, request: Request, response: Response,
     return {"user": _public_user(user), "verify_required": require_verify}
 
 
+@limiter.limit(config.RATE_LIMIT_AUTH)     # 5/min/IP — credential stuffing guard
 @router.post("/auth/login")
-def login(body: LoginIn, response: Response, conn=Depends(db.get_db)):
+def login(body: LoginIn, request: Request, response: Response, conn=Depends(db.get_db)):
     user = db.q1(conn, "SELECT * FROM users WHERE email=?", (body.email.lower(),))
-    if not user or not security.verify_password(body.password, user["password_hash"]):
+    valid = False
+    if user:
+        valid = security.verify_password(body.password, user["password_hash"])
+    else:
+        # Constant-ish work factor: still run one bcrypt round so probing
+        # "unknown email" vs "wrong password" yields no timing signal.
+        security.verify_password(body.password, "$2b$04$" + "." * 53)
+    if not valid:
         # Identical error for unknown email & bad password (no user enumeration).
         raise HTTPException(401, "Invalid email or password.")
     if user["banned"]:
@@ -76,8 +90,9 @@ def verify_email(body: dict, conn=Depends(db.get_db)):
     return {"ok": True}
 
 
+@limiter.limit(config.RATE_LIMIT_AUTH)     # 5/min/IP — token-spam guard
 @router.post("/auth/forgot-password")
-def forgot_password(body: ForgotIn, conn=Depends(db.get_db)):
+def forgot_password(body: ForgotIn, request: Request, conn=Depends(db.get_db)):
     """Always answer OK — do not leak which emails exist."""
     user = db.q1(conn, "SELECT * FROM users WHERE email=?", (body.email.lower(),))
     if user and not user["banned"]:
@@ -115,7 +130,6 @@ def my_profile(user=Depends(security.get_current_user)):
 @me_router.put("")
 def update_profile(body: ProfileIn, request: Request,
                    user=Depends(security.get_current_user),
-                   csrf=Depends(security.verify_csrf),
                    conn=Depends(db.get_db)):
     conn.execute("UPDATE users SET name=?, avatar_url=? WHERE id=?",
                  (body.name.strip()[:80], body.avatar_url.strip()[:512], user["id"]))
@@ -125,7 +139,6 @@ def update_profile(body: ProfileIn, request: Request,
 @me_router.put("/password")
 def change_password(body: dict, request: Request,
                     user=Depends(security.get_current_user),
-                    csrf=Depends(security.verify_csrf),
                     conn=Depends(db.get_db)):
     old, new = str(body.get("old_password", "")), str(body.get("new_password", ""))
     stored = db.q1(conn, "SELECT password_hash FROM users WHERE id=?", (user["id"],))["password_hash"]

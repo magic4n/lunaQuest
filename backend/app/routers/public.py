@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from .. import config, db, security, surveys as S
+from . import surveys as _r
 from ..schemas import SubmitIn
 
 router = APIRouter(prefix="/public", tags=["public"])
@@ -84,7 +85,7 @@ def get_public_survey(slug: str, request: Request, conn=Depends(db.get_db)):
     user = security.user_from_request(request, conn)
 
     needs_password = bool(settings.get("password_hash")) and not _is_unlocked(s["id"])
-    qs = [S._decode_question(q, shuffle_for_taker=bool(settings.get("shuffle_questions")))
+    qs = [_r._decode_question(q, shuffle=bool(settings.get("shuffle_questions")))
           for q in db.q(conn, "SELECT * FROM questions WHERE survey_id=? ORDER BY ordr", (s["id"],))]
     # Strip quiz answers from the taker payload (server grades invisibly).
     for q in qs:
@@ -112,7 +113,7 @@ def get_public_survey(slug: str, request: Request, conn=Depends(db.get_db)):
 
 
 @router.post("/surveys/{slug}/unlock")
-def unlock(slug: str, body: dict, csrf=Depends(security.verify_csrf), conn=Depends(db.get_db)):
+def unlock(slug: str, body: dict, conn=Depends(db.get_db)):
     """Password-protected surveys: verify once, remember for 15 minutes."""
     loaded = _load_public_survey(conn, slug)
     s, settings = loaded["row"], loaded["settings"]
@@ -130,7 +131,6 @@ def unlock(slug: str, body: dict, csrf=Depends(security.verify_csrf), conn=Depen
 # ---------------------------------------------------------------------------
 @router.post("/surveys/{slug}/submit")
 def submit(slug: str, body: SubmitIn, request: Request,
-           csrf=Depends(security.verify_csrf),
            conn=Depends(db.get_db)):
     loaded = _load_public_survey(conn, slug)
     s, settings = loaded["row"], loaded["settings"]
@@ -150,11 +150,17 @@ def submit(slug: str, body: SubmitIn, request: Request,
         if cnt >= int(max_r):
             raise HTTPException(410, "This survey has reached its response limit.")
 
-    # One response per user/IP (anonymous dedupe uses salted IP hash).
+    # Identity for dedupe/drafts.  NOTE: we deliberately do NOT trust
+    # X-Forwarded-For here — unlike rate limiting (where spoofing only affects
+    # your own quota), trusting a client-supplied header would let anyone set
+    # it to "1.2.3.4" and bypass one-response-per-IP limits entirely.  The
+    # socket peer is the honest key; behind a proxy operators can set
+    # LUNAQ_TRUST_PROXY=1 to switch to the first XFF hop at their discretion.
     ip = request.client.host if request.client else "unknown"
-    xff = request.headers.get("x-forwarded-for", "")
-    if xff:
-        ip = xff.split(",")[0].strip()
+    if config.TRUST_PROXY:
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            ip = xff.split(",")[0].strip()
     iph = db.hash_ip(ip)
     uah = db.hash_ua(request.headers.get("user-agent", ""))
     if settings.get("one_per_user") and body.submit:
@@ -291,7 +297,6 @@ def my_draft(slug: str, request: Request, conn=Depends(db.get_db)):
 # ---------------------------------------------------------------------------
 @router.post("/surveys/{slug}/upload")
 async def upload_file(slug: str, request: Request, file: UploadFile,
-                      csrf=Depends(security.verify_csrf),
                       conn=Depends(db.get_db)):
     loaded = _load_public_survey(conn, slug)
     s, settings = loaded["row"], loaded["settings"]

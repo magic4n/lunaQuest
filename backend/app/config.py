@@ -78,6 +78,11 @@ SMTP_TLS = os.environ.get("LUNAQ_SMTP_TLS", "1") == "1"
 
 PUBLIC_BASE_URL = os.environ.get("LUNAQ_PUBLIC_URL", "http://localhost:8000")
 
+# Set to 1 ONLY when a hardened reverse proxy (Caddy/Nginx) rewrites
+# X-Forwarded-For; controls whether public endpoints derive client IPs
+# from that header (see routers/public.py dedupe note).
+TRUST_PROXY = os.environ.get("LUNAQ_TRUST_PROXY", "0") == "1"
+
 # Cookie names
 COOKIE_SESSION = "lq_session"     # httpOnly JWT session cookie
 COOKIE_CSRF = "lq_csrf"           # readable by JS, mirrored in X-CSRF-Token header

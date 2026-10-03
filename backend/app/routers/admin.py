@@ -35,7 +35,6 @@ def list_users(page: int = Query(1, ge=1),
 
 @router.post("/users/{user_id}/ban")
 def ban_user(user_id: int, body: dict, request: Request,
-             csrf=Depends(security.verify_csrf),
              admin=Depends(security.require_admin), conn=Depends(db.get_db)):
     banned = bool(body.get("banned", True))
     if user_id == admin["id"]:
@@ -46,7 +45,6 @@ def ban_user(user_id: int, body: dict, request: Request,
 
 @router.post("/users/{user_id}/role")
 def set_role(user_id: int, body: dict, request: Request,
-             csrf=Depends(security.verify_csrf),
              admin=Depends(security.require_admin), conn=Depends(db.get_db)):
     role = body.get("role")
     if role not in ("user", "admin"):
@@ -59,7 +57,6 @@ def set_role(user_id: int, body: dict, request: Request,
 
 @router.delete("/users/{user_id}")
 def delete_user(user_id: int, request: Request,
-                csrf=Depends(security.verify_csrf),
                 admin=Depends(security.require_admin), conn=Depends(db.get_db)):
     if user_id == admin["id"]:
         raise HTTPException(422, "You cannot delete your own account here.")
@@ -94,7 +91,6 @@ def all_surveys(page: int = Query(1, ge=1),
 
 @router.post("/surveys/{survey_id}/force-close")
 def force_close(survey_id: int, request: Request,
-                csrf=Depends(security.verify_csrf),
                 admin=Depends(security.require_admin), conn=Depends(db.get_db)):
     conn.execute("UPDATE surveys SET closed=1 WHERE id=?", (survey_id,))
     return {"closed": True}
@@ -102,7 +98,6 @@ def force_close(survey_id: int, request: Request,
 
 @router.delete("/surveys/{survey_id}")
 def admin_delete_survey(survey_id: int, request: Request,
-                        csrf=Depends(security.verify_csrf),
                         admin=Depends(security.require_admin), conn=Depends(db.get_db)):
     conn.execute("DELETE FROM surveys WHERE id=?", (survey_id,))
     return {"deleted": True}
@@ -128,7 +123,6 @@ def get_settings(admin=Depends(security.require_admin), conn=Depends(db.get_db))
 
 @router.put("/settings")
 def put_settings(body: AdminSettingsIn, request: Request,
-                 csrf=Depends(security.verify_csrf),
                  admin=Depends(security.require_admin), conn=Depends(db.get_db)):
     data = body.model_dump()
     conn.execute("BEGIN")
@@ -160,7 +154,6 @@ def stats(admin=Depends(security.require_admin), conn=Depends(db.get_db)):
 
 @router.post("/backup")
 def trigger_backup(request: Request,
-                   csrf=Depends(security.verify_csrf),
                    admin=Depends(security.require_admin)):
     """Create an online-consistent .sqlite snapshot and stream it to the caller.
 

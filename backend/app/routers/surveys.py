@@ -79,7 +79,6 @@ def list_surveys(request: Request,
 # ---------------------------------------------------------------------------
 @router.post("", status_code=201)
 def create_survey(body: SurveyIn, request: Request,
-                  csrf=Depends(security.verify_csrf),
                   conn=Depends(db.get_db)):
     user = security.user_from_request(request, conn)
     if not user:
@@ -115,7 +114,6 @@ def get_survey(survey_id: int, request: Request, conn=Depends(db.get_db)):
 # ---------------------------------------------------------------------------
 @router.put("/{survey_id}")
 def update_survey(survey_id: int, body: SurveyIn, request: Request,
-                  csrf=Depends(security.verify_csrf),
                   conn=Depends(db.get_db)):
     user = security.user_from_request(request, conn)
     s = S.get_survey_or_404(conn, survey_id)
@@ -179,7 +177,6 @@ def _replace_questions(conn, survey_id: int, questions: list) -> None:
 # ---------------------------------------------------------------------------
 @router.post("/{survey_id}/publish")
 def publish(survey_id: int, body: dict, request: Request,
-            csrf=Depends(security.verify_csrf),
             conn=Depends(db.get_db)):
     user = security.user_from_request(request, conn)
     s = S.get_survey_or_404(conn, survey_id)
@@ -194,7 +191,6 @@ def publish(survey_id: int, body: dict, request: Request,
 
 @router.post("/{survey_id}/close")
 def close(survey_id: int, request: Request,
-          csrf=Depends(security.verify_csrf),
           conn=Depends(db.get_db)):
     user = security.user_from_request(request, conn)
     s = S.get_survey_or_404(conn, survey_id)
@@ -205,7 +201,6 @@ def close(survey_id: int, request: Request,
 
 @router.delete("/{survey_id}")
 def delete_survey(survey_id: int, request: Request,
-                  csrf=Depends(security.verify_csrf),
                   conn=Depends(db.get_db)):
     user = security.user_from_request(request, conn)
     s = S.get_survey_or_404(conn, survey_id)
@@ -218,7 +213,6 @@ def delete_survey(survey_id: int, request: Request,
 
 @router.post("/{survey_id}/duplicate", status_code=201)
 def duplicate(survey_id: int, request: Request,
-              csrf=Depends(security.verify_csrf),
               conn=Depends(db.get_db)):
     """Copy survey + questions into a new draft owned by the caller."""
     user = security.user_from_request(request, conn)
@@ -254,7 +248,6 @@ def list_shares(survey_id: int, request: Request, conn=Depends(db.get_db)):
 
 @router.post("/{survey_id}/shares", status_code=201)
 def add_share(survey_id: int, body: ShareIn, request: Request,
-              csrf=Depends(security.verify_csrf),
               conn=Depends(db.get_db)):
     user = security.user_from_request(request, conn)
     s = S.get_survey_or_404(conn, survey_id)
@@ -273,7 +266,6 @@ def add_share(survey_id: int, body: ShareIn, request: Request,
 
 @router.delete("/{survey_id}/shares/{share_id}")
 def remove_share(survey_id: int, share_id: int, request: Request,
-                 csrf=Depends(security.verify_csrf),
                  conn=Depends(db.get_db)):
     user = security.user_from_request(request, conn)
     s = S.get_survey_or_404(conn, survey_id)
